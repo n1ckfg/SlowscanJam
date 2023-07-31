@@ -1,0 +1,6 @@
+[submodule "Cassette-Video-Decoder"]
+	path = third_party/Cassette-Video-Decoder
+	url = https://github.com/n1ckfg/Cassette-Video-Decoder
+[submodule "third_party/Cassette-Video-Encoder"]
+	path = third_party/Cassette-Video-Encoder
+	url = https://github.com/n1ckfg/Cassette-Video-Encoder
