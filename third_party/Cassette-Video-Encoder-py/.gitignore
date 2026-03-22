@@ -1,0 +1,8 @@
+output/
+env/
+.vscode/
+*.jpg
+*.png
+*.wav
+.DS_Store
+
