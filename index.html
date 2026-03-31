@@ -487,17 +487,18 @@
     let encoder = null;
     let decoder = null;
     let audioCtx = null;
-    let audioSource = null;
+    let audioOutputNode = null;
     let isRunning = false;
-    let audioDataBuffer = { left: [], right: [] };
-    
+    let audioQueue = { left: [], right: [] };
+    let audioQueueReadIndex = 0;
+
     function init() {
         encoder = new SlowscanEncoder({
             sampleRate: 96000,
             fps: parseFloat(document.getElementById('fps').value),
             lines: parseInt(document.getElementById('lines').value)
         });
-        
+
         decoder = new SlowscanDecoder({
             canvas: decodedCanvas,
             lineWidth: parseFloat(document.getElementById('lineWidth').value),
@@ -505,17 +506,34 @@
             saturation: parseFloat(document.getElementById('saturation').value),
             blend: document.getElementById('blend').checked
         });
-        
+
         audioCtx = decoder.audioCtx;
-        
-        // Create audio buffer source to play the encoded audio
-        const audioBufferSize = encoder.widthSamples;
-        const audioBuffer = audioCtx.createBuffer(2, audioBufferSize, audioCtx.sampleRate);
-        
-        audioSource = audioCtx.createBufferSource();
-        audioSource.buffer = audioBuffer;
-        audioSource.loop = true;
-        audioSource.connect(audioCtx.destination);
+
+        // Create ScriptProcessorNode for continuous audio output
+        audioOutputNode = audioCtx.createScriptProcessor(2048, 0, 2);
+        audioOutputNode.onaudioprocess = function(e) {
+            const leftOut = e.outputBuffer.getChannelData(0);
+            const rightOut = e.outputBuffer.getChannelData(1);
+
+            for (let i = 0; i < leftOut.length; i++) {
+                if (audioQueueReadIndex < audioQueue.left.length) {
+                    leftOut[i] = audioQueue.left[audioQueueReadIndex] * 0.5;
+                    rightOut[i] = audioQueue.right[audioQueueReadIndex] * 0.5;
+                    audioQueueReadIndex++;
+                } else {
+                    leftOut[i] = 0;
+                    rightOut[i] = 0;
+                }
+            }
+
+            // Trim consumed samples from queue periodically
+            if (audioQueueReadIndex > 48000) {
+                audioQueue.left = audioQueue.left.slice(audioQueueReadIndex);
+                audioQueue.right = audioQueue.right.slice(audioQueueReadIndex);
+                audioQueueReadIndex = 0;
+            }
+        };
+        audioOutputNode.connect(audioCtx.destination);
     }
     
     function visualizeEncoded(left, right) {
@@ -620,20 +638,11 @@
             const rightChunk = right.slice(i, i + bufferSize);
             decoder.process(leftChunk, rightChunk);
         }
-        
-        // Play audio through speakers
-        if (audioSource && audioCtx) {
-            const leftData = audioSource.buffer.getChannelData(0);
-            const rightData = audioSource.buffer.getChannelData(1);
-            const copyLen = Math.min(left.length, leftData.length);
-            for (let i = 0; i < copyLen; i++) {
-                leftData[i] = left[i] * 0.5;
-                rightData[i] = right[i] * 0.5;
-            }
-            if (!audioSource.started) {
-                audioSource.start(0);
-                audioSource.started = true;
-            }
+
+        // Queue audio for playback through speakers
+        for (let i = 0; i < left.length; i++) {
+            audioQueue.left.push(left[i]);
+            audioQueue.right.push(right[i]);
         }
         
         // Visualize encoded signal
@@ -653,7 +662,6 @@
             init();
             await startCamera();
             decoder.activate();
-            if (audioSource) audioSource.start(0);
             isRunning = true;
             statusEl.textContent = 'Running: Camera -> Encoder -> Decoder -> Display';
             processFrame();
