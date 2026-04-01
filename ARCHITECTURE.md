@@ -49,7 +49,8 @@ Camera → SlowscanEncoder → Audio Signal → SlowscanDecoder → Canvas Displ
 - Handles interlaced field encoding (alternates even/odd lines)
 
 **SlowscanDecoder** (lines 212-472)
-- Processes stereo audio input sample-by-sample
+- Processes stereo audio input sample-by-sample (in streaming chunks)
+- Uses Auto-Gain Control (AGC) tracking of signal bounds across chunks to map audio levels to color values correctly
 - Detects sync pulses to determine line/frame boundaries
 - Reconstructs YCbCr from audio levels
 - Converts back to RGB for display

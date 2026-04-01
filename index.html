@@ -285,7 +285,8 @@
         
         process(lSamples, cSamples) {
             const sampleRate = this.sampleRate;
-            const s = { LMin: -0.025, LMax: 0.025, CMin: -0.05, CMax: 0.05 };
+            if (!this.s) this.s = { LMin: -0.025, LMax: 0.025, CMin: -0.05, CMax: 0.05 };
+            const s = this.s;
             const p = this.pulse;
             
             for (let i = 0; i < lSamples.length; i++) {
