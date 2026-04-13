@@ -51,10 +51,19 @@ Camera → SlowscanEncoder → Audio Signal → SlowscanDecoder → Canvas Displ
 **SlowscanDecoder** (lines 212-472)
 - Processes stereo audio input sample-by-sample (in streaming chunks)
 - Uses Auto-Gain Control (AGC) tracking of signal bounds across chunks to map audio levels to color values correctly
+- Injects a small amount of random noise into samples during decoding to prevent zero-difference tracking issues in the AGC, faithfully matching original Python and JS reference decoders
 - Detects sync pulses to determine line/frame boundaries
 - Reconstructs YCbCr from audio levels
 - Converts back to RGB for display
 - Renders with CRT-style effects (blend mode, line width, phosphor fade)
+
+### Synchronization and Dynamic Parameters
+
+The system computes critical timing parameters dynamically whenever the `fps` or `lines` settings are updated, injecting these values into the decoder to maintain a perfectly faithful signal-lock. This logic calculates parameters matching the original `enc.js` reference outputs:
+- `hTime` = `(1 / fps / lines) * 2`
+- `widthSamples` = `hTime - (pulseLength * 4)`
+- `overScan` = `widthSamples / hTime`
+- `hOffset` = `(pulseLength * 1.45) / hTime`
 
 ### Key Parameters
 

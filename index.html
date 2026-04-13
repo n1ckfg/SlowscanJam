@@ -227,6 +227,7 @@
             
             const cfg = { ...defaults, ...config };
             this.bufferSize = cfg.bufferSize;
+            this.sig = { LMin: 0.0, LMax: 1.0, CMin: -1.0, CMax: 1.0 };
             this.hPhase = 0;
             this.vPhase = 0;
             
@@ -253,7 +254,7 @@
             this.brightness = cfg.brightness;
             this.saturation = cfg.saturation;
             
-            this.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            this.audioCtx = config.audioCtx || new (window.AudioContext || window.webkitAudioContext)();
             this.sampleRate = this.audioCtx.sampleRate;
             this.hFreqTarget = 1.0 / cfg.hFreq * this.sampleRate;
             this.vFreqTarget = 1.0 / cfg.vFreq * this.sampleRate;
@@ -285,15 +286,14 @@
         
         process(lSamples, cSamples) {
             const sampleRate = this.sampleRate;
-            if (!this.s) this.s = { LMin: -0.025, LMax: 0.025, CMin: -0.05, CMax: 0.05 };
-            const s = this.s;
+            const s = this.sig;
             const p = this.pulse;
             
             for (let i = 0; i < lSamples.length; i++) {
                 this.timing.time += 1;
                 
-                let lSample = lSamples[i];
-                let cSample = cSamples[i];
+                let lSample = lSamples[i] + Math.random() * 0.01 - 0.005;
+                let cSample = cSamples[i] + Math.random() * 0.01 - 0.005;
                 
                 if (lSample < s.LMin) s.LMin = lSample;
                 if (lSample > s.LMax) s.LMax = lSample;
@@ -494,47 +494,70 @@
     let audioQueueReadIndex = 0;
 
     function init() {
+        const fps = parseFloat(document.getElementById('fps').value);
+        const lines = parseInt(document.getElementById('lines').value);
+        const pulseLength = 0.2 / 1000;
+        
+        const hTime = (1 / fps / lines) * 2;
+        const widthSamples = hTime - (pulseLength * 4);
+        
+        const hFreq = 1.0 / hTime;
+        const vFreq = fps;
+        const overScan = widthSamples / hTime;
+        const hOffset = (pulseLength * 1.45) / hTime;
+
         encoder = new SlowscanEncoder({
             sampleRate: 96000,
-            fps: parseFloat(document.getElementById('fps').value),
-            lines: parseInt(document.getElementById('lines').value)
+            fps: fps,
+            lines: lines,
+            pulseLength: pulseLength
         });
+
+        if (decoder) decoder.stop();
 
         decoder = new SlowscanDecoder({
             canvas: decodedCanvas,
             lineWidth: parseFloat(document.getElementById('lineWidth').value),
             brightness: parseFloat(document.getElementById('brightness').value),
             saturation: parseFloat(document.getElementById('saturation').value),
-            blend: document.getElementById('blend').checked
+            blend: document.getElementById('blend').checked,
+            audioCtx: audioCtx,
+            hFreq: hFreq,
+            vFreq: vFreq,
+            overScan: overScan,
+            hOffset: hOffset,
+            pulseLength: pulseLength
         });
 
-        audioCtx = decoder.audioCtx;
+        if (!audioCtx) {
+            audioCtx = decoder.audioCtx;
 
-        // Create ScriptProcessorNode for continuous audio output
-        audioOutputNode = audioCtx.createScriptProcessor(2048, 0, 2);
-        audioOutputNode.onaudioprocess = function(e) {
-            const leftOut = e.outputBuffer.getChannelData(0);
-            const rightOut = e.outputBuffer.getChannelData(1);
+            // Create ScriptProcessorNode for continuous audio output
+            audioOutputNode = audioCtx.createScriptProcessor(2048, 0, 2);
+            audioOutputNode.onaudioprocess = function(e) {
+                const leftOut = e.outputBuffer.getChannelData(0);
+                const rightOut = e.outputBuffer.getChannelData(1);
 
-            for (let i = 0; i < leftOut.length; i++) {
-                if (audioQueueReadIndex < audioQueue.left.length) {
-                    leftOut[i] = audioQueue.left[audioQueueReadIndex] * 0.5;
-                    rightOut[i] = audioQueue.right[audioQueueReadIndex] * 0.5;
-                    audioQueueReadIndex++;
-                } else {
-                    leftOut[i] = 0;
-                    rightOut[i] = 0;
+                for (let i = 0; i < leftOut.length; i++) {
+                    if (audioQueueReadIndex < audioQueue.left.length) {
+                        leftOut[i] = audioQueue.left[audioQueueReadIndex] * 0.5;
+                        rightOut[i] = audioQueue.right[audioQueueReadIndex] * 0.5;
+                        audioQueueReadIndex++;
+                    } else {
+                        leftOut[i] = 0;
+                        rightOut[i] = 0;
+                    }
                 }
-            }
 
-            // Trim consumed samples from queue periodically
-            if (audioQueueReadIndex > 48000) {
-                audioQueue.left = audioQueue.left.slice(audioQueueReadIndex);
-                audioQueue.right = audioQueue.right.slice(audioQueueReadIndex);
-                audioQueueReadIndex = 0;
-            }
-        };
-        audioOutputNode.connect(audioCtx.destination);
+                // Trim consumed samples from queue periodically
+                if (audioQueueReadIndex > 48000) {
+                    audioQueue.left = audioQueue.left.slice(audioQueueReadIndex);
+                    audioQueue.right = audioQueue.right.slice(audioQueueReadIndex);
+                    audioQueueReadIndex = 0;
+                }
+            };
+            audioOutputNode.connect(audioCtx.destination);
+        }
     }
     
     function visualizeEncoded(left, right) {
@@ -571,10 +594,12 @@
     // UI Control handlers
     document.getElementById('lines').addEventListener('input', function() {
         document.getElementById('linesVal').textContent = this.value;
+        if (isRunning) init();
     });
     
     document.getElementById('fps').addEventListener('input', function() {
         document.getElementById('fpsVal').textContent = this.value;
+        if (isRunning) init();
     });
     
     document.getElementById('lineWidth').addEventListener('input', function() {
