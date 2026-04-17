@@ -41,21 +41,35 @@ Camera → SlowscanEncoder → Audio Signal → SlowscanDecoder → Canvas Displ
 
 ### Components
 
-**SlowscanEncoder** (lines 80-207)
+**SlowscanEncoder**
 - Captures video frames from webcam
 - Converts RGB to YCbCr color space
 - Generates sync pulses for line/frame timing
 - Outputs stereo audio: left=luma, right=chroma
 - Handles interlaced field encoding (alternates even/odd lines)
+- Preallocates `Float32Array` scratch and output buffers sized from the frame dimensions; `encodeFrame` writes via an index (no `push` / spread) and produces zero per-frame heap allocations
+- Polyphase lowpass filter coefficients are computed once in the constructor; `resampleInto` has a fast no-mirror branch for interior samples
 
-**SlowscanDecoder** (lines 212-472)
+**SlowscanDecoder**
 - Processes stereo audio input sample-by-sample (in streaming chunks)
 - Uses Auto-Gain Control (AGC) tracking of signal bounds across chunks to map audio levels to color values correctly
-- Injects a small amount of random noise into samples during decoding to prevent zero-difference tracking issues in the AGC, faithfully matching original Python and JS reference decoders
+- Injects a small amount of pseudo-noise into samples during decoding to prevent zero-difference tracking issues in the AGC, faithfully matching original Python and JS reference decoders. Noise is sourced from a precomputed 4096-sample LUT with decorrelated L/C read indices — `Math.random()` is not called in the hot loop
 - Detects sync pulses to determine line/frame boundaries
-- Reconstructs YCbCr from audio levels
-- Converts back to RGB for display
-- Renders with CRT-style effects (blend mode, line width, phosphor fade)
+- Reconstructs YCbCr from audio levels; YCbCr→RGB is inlined in the per-sample loop to avoid array allocation
+- Chroma delay line is a preallocated `Float32Array`, not a growable JS array
+- Per-scanline color samples are written into `Float32Array` (phase) + `Uint8Array` (RGB), and line objects are recycled through a pool so the sample loop performs no per-sample allocation
+- Delegates display rendering to a pluggable renderer (WebGL preferred, Canvas 2D fallback)
+
+**WebGLPhosphor (GLSL renderer)**
+- Default renderer for the decoded display
+- Each scanline is emitted as a triangle-strip quad whose two vertices carry identical per-sample RGB, so the GPU rasterizer interpolates color across each line
+- A simple fragment shader writes `vec4(v_col, 1.0)`; blend mode is additive (`ONE, ONE`) when the Blend Mode checkbox is on, approximating the original `screen` phosphor glow
+- Phosphor fade is implemented as a semi-transparent black quad drawn through the shader on a fixed interval
+- Replaces the slow CPU path of building many-stop `createLinearGradient` strokes per line in Canvas 2D
+
+**Canvas2DPhosphor (fallback)**
+- Used only if WebGL context creation fails
+- Decimates gradient stops to a small maximum so `createLinearGradient` stays fast even at high per-line sample counts
 
 ### Synchronization and Dynamic Parameters
 
@@ -152,10 +166,31 @@ B = Y + 1.766*Cb
 ## Display Rendering
 
 The decoder renders with CRT-style effects:
-- **Gradient strokes**: Each scan line rendered as a horizontal gradient
-- **Screen blend mode**: Additive blending for phosphor glow effect
-- **Phosphor fade**: Gradual darkening (5% per clearInterval)
-- **Jitter**: Random 2px offset for analog noise aesthetic
+- **GPU scanline quads**: Each scan line is a triangle-strip quad with per-vertex RGB; the GPU interpolates color along the line
+- **Additive blend**: WebGL `blendFunc(ONE, ONE)` approximates the original Canvas `screen` phosphor glow
+- **Phosphor fade**: Gradual darkening via a semi-transparent black quad drawn on a fixed interval
+- **Jitter**: Random sub-pixel offset per line for analog noise aesthetic
+
+### Pipeline pluggability
+
+The decoder selects its renderer at construction:
+1. Try `WebGLPhosphor` — uses GLSL vertex + fragment shaders.
+2. Fall back to `Canvas2DPhosphor` — uses `createLinearGradient` with decimated color stops.
+
+### Why not move decoding to a shader?
+
+The decoder's sample loop is sequential by nature: AGC bounds, sync detection, and phase tracking all carry state forward sample-to-sample. GPU parallelism doesn't help a serial feedback loop, so the CPU loop was optimized in place (typed arrays, no allocations, precomputed noise LUT) rather than ported to GLSL. Only the render step — which is embarrassingly parallel per line/pixel — was moved to shaders.
+
+## Audio Playback Queue
+
+Stereo samples produced by each encode pass are buffered for playback through `ScriptProcessorNode`. The queue is a **power-of-two `Float32Array` ring buffer** (262144 samples ≈ 2.7s at 96 kHz) with masked read/write indices. If the producer laps the consumer, the read head advances to drop the oldest samples rather than corrupting ordering. This replaced JS arrays that were grown with `push` and periodically `slice`-trimmed (O(n) churn on the audio thread).
+
+## Layout
+
+The browser UI arranges the three canvases in two columns:
+- **Left column**: SOURCE (camera) on top, DECODED (output) below
+- **Right column**: ENCODED (audio signal preview)
+- Controls panel is fixed top-right
 
 ## Running the Application
 
