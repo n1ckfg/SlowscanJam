@@ -5,8 +5,9 @@
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { background: #000; color: #fff; font-family: monospace; overflow: hidden; }
-        #container { display: flex; flex-direction: column; height: 100vh; padding: 10px; }
-        .panel { margin-bottom: 10px; }
+        #container { display: flex; flex-direction: row; align-items: flex-start; gap: 10px; height: 100vh; padding: 10px; }
+        .column { display: flex; flex-direction: column; gap: 10px; }
+        .panel { margin-bottom: 0; }
         .label { color: #ff6b00; margin-bottom: 5px; font-size: 12px; }
         canvas { border: 1px solid #333; width: 640px; height: 360px; image-rendering: pixelated; max-width: 100%; }
         #source { border-color: #0f0; }
@@ -25,35 +26,39 @@
 </head>
 <body>
     <button id="startBtn">Click to Start Camera</button>
-    
+
     <div id="container">
-        <div class="panel">
-            <div class="label">SOURCE (Camera Input)</div>
-            <canvas id="source" width="320" height="150"></canvas>
+        <div class="column">
+            <div class="panel">
+                <div class="label">SOURCE (Camera Input)</div>
+                <canvas id="source" width="320" height="150"></canvas>
+            </div>
+            <div class="panel">
+                <div class="label">DECODED (Output Display)</div>
+                <canvas id="decoded" width="640" height="360"></canvas>
+            </div>
         </div>
-        <div class="panel">
-            <div class="label">ENCODED (Audio Signal Preview)</div>
-            <canvas id="encoded" width="320" height="150"></canvas>
-        </div>
-        <div class="panel">
-            <div class="label">DECODED (Output Display)</div>
-            <canvas id="decoded" width="640" height="360"></canvas>
+        <div class="column">
+            <div class="panel">
+                <div class="label">ENCODED (Audio Signal Preview)</div>
+                <canvas id="encoded" width="320" height="150"></canvas>
+            </div>
         </div>
     </div>
-    
+
     <div id="controls">
         <h3>Encoder/Decoder Controls</h3>
         <div class="control-row">
-            <label>Lines: <span id="linesVal">150</span></label>
-            <input type="range" id="lines" min="50" max="200" step="10" value="150">
+            <label>Lines: <span id="linesVal">200</span></label>
+            <input type="range" id="lines" min="50" max="200" step="10" value="200">
         </div>
         <div class="control-row">
-            <label>FPS: <span id="fpsVal">3</span></label>
-            <input type="range" id="fps" min="1" max="6" step="0.5" value="3">
+            <label>FPS: <span id="fpsVal">6</span></label>
+            <input type="range" id="fps" min="1" max="6" step="0.5" value="6">
         </div>
         <div class="control-row">
-            <label>Line Width: <span id="lineWidthVal">2.5</span></label>
-            <input type="range" id="lineWidth" min="0.5" max="5" step="0.5" value="2.5">
+            <label>Line Width: <span id="lineWidthVal">5</span></label>
+            <input type="range" id="lineWidth" min="0.5" max="5" step="0.5" value="5">
         </div>
         <div class="control-row">
             <label>Brightness: <span id="brightnessVal">1.0</span></label>
@@ -64,18 +69,20 @@
             <input type="range" id="saturation" min="0.5" max="2" step="0.1" value="1">
         </div>
         <div class="control-row">
-            <label><input type="checkbox" id="blend" checked> Blend Mode</label>
+            <label><input type="checkbox" id="blend"> Blend Mode</label>
         </div>
         <div class="control-row">
             <label><input type="checkbox" id="showAudio"> Show Audio Waveform</label>
         </div>
     </div>
-    
+
     <div id="status">Waiting to start...</div>
 
     <script>
     // ============================================
     // SLOWSCAN ENCODER - Converts video frames to stereo audio
+    // Preallocates typed-array scratch buffers so encodeFrame does zero
+    // heap allocations and writes via indexed assignment instead of push/spread.
     // ============================================
     class SlowscanEncoder {
         constructor(config = {}) {
@@ -84,131 +91,149 @@
             this.lines = config.lines || 150;
             this.pulseLength = config.pulseLength || 0.2 / 1000;
             this.oversample = config.oversample || 10;
-            this.bufferSize = 512;
-            
+
             this.hTime = (1 / this.fps / this.lines) * 2;
             this.widthSamples = (this.hTime - (this.pulseLength * 4)) * this.sampleRate;
             this.widthPixels = Math.round(this.widthSamples * this.oversample);
-            
             this.pulseLengthSamples = Math.round(this.pulseLength * this.sampleRate * this.oversample);
-            
+
             this.field = 0;
-            
-            this.leftBuffer = [];
-            this.rightBuffer = [];
-        }
-        
-        rgbToYcbcr(r, g, b) {
-            let y = 0.299 * r + 0.587 * g + 0.114 * b;
-            let cb = -0.168736 * r - 0.331264 * g + 0.5 * b + 128;
-            let cr = 0.5 * r - 0.418688 * g - 0.081312 * b + 128;
-            return [y, cb, cr];
-        }
-        
-        resamplePoly(arr, down) {
-            const factor = down;
-            const out = new Float64Array(Math.ceil(arr.length / factor));
+
+            // Precompute polyphase lowpass filter (same shape as original resamplePoly).
+            const factor = this.oversample;
             const taps = factor * 4 + 1;
-            const filter = new Float64Array(taps);
-            let sum = 0;
-            
+            this.filterTaps = taps;
+            this.filterHalf = (taps - 1) / 2;
+            this.filter = new Float32Array(taps);
+            let fsum = 0;
             for (let i = 0; i < taps; i++) {
-                let n = i - (taps - 1) / 2;
-                filter[i] = n === 0 ? 1.0 : Math.sin(Math.PI * n / factor) / (Math.PI * n);
-                filter[i] *= 0.54 - 0.46 * Math.cos(2 * Math.PI * i / (taps - 1));
-                sum += filter[i];
+                const n = i - this.filterHalf;
+                let v = n === 0 ? 1.0 : Math.sin(Math.PI * n / factor) / (Math.PI * n);
+                v *= 0.54 - 0.46 * Math.cos(2 * Math.PI * i / (taps - 1));
+                this.filter[i] = v;
+                fsum += v;
             }
-            for (let i = 0; i < taps; i++) filter[i] /= sum;
-            
-            for (let i = 0; i < out.length; i++) {
-                let val = 0, center = i * factor;
-                for (let j = 0; j < taps; j++) {
-                    let idx = center + j - (taps - 1) / 2;
-                    if (idx >= 0 && idx < arr.length) val += arr[idx] * filter[j];
-                    else if (idx < 0) val += arr[Math.min(-idx, arr.length - 1)] * filter[j];
-                    else val += arr[Math.max(0, arr.length - 1 - (idx - arr.length + 1))] * filter[j];
+            for (let i = 0; i < taps; i++) this.filter[i] /= fsum;
+
+            const P = this.pulseLengthSamples;
+            const W = this.widthPixels;
+            const halfLines = Math.floor(this.lines / 2);
+            // Field sync = 3P (2P pulses + P quiet). Every line = W + P quiet.
+            // Lines 1..halfLines-1 get a 3P sync prefix before the line data.
+            this.oversampledSize = 3 * P + halfLines * (W + P) + (halfLines - 1) * 3 * P;
+
+            this.leftOS = new Float32Array(this.oversampledSize);
+            this.rightOS = new Float32Array(this.oversampledSize);
+
+            this.outSize = Math.ceil(this.oversampledSize / factor);
+            this.outLeft = new Float32Array(this.outSize);
+            this.outRight = new Float32Array(this.outSize);
+        }
+
+        encodeFrame(frameData, width, height) {
+            const P = this.pulseLengthSamples;
+            const W = this.widthPixels;
+            const halfLines = Math.floor(this.lines / 2);
+            const srcHeight = Math.min(height, this.lines);
+            const srcWidth = Math.min(width, W);
+
+            const L = this.leftOS, R = this.rightOS;
+            let idx = 0;
+
+            // Field sync
+            if (this.field === 0) {
+                for (let i = 0; i < P; i++) { L[idx] = -1; R[idx] = 1; idx++; }
+                for (let i = 0; i < P; i++) { L[idx] = 1; R[idx] = -1; idx++; }
+            } else {
+                for (let i = 0; i < P; i++) { L[idx] = 1; R[idx] = -1; idx++; }
+                for (let i = 0; i < P; i++) { L[idx] = -1; R[idx] = 1; idx++; }
+            }
+            for (let i = 0; i < P; i++) { L[idx] = 0; R[idx] = 0; idx++; }
+
+            for (let ln = 0; ln < halfLines; ln++) {
+                if (ln !== 0) {
+                    if ((ln & 1) === 0) {
+                        for (let i = 0; i < P; i++) { L[idx] = 1; R[idx] = 1; idx++; }
+                        for (let i = 0; i < P; i++) { L[idx] = -1; R[idx] = -1; idx++; }
+                    } else {
+                        for (let i = 0; i < P; i++) { L[idx] = -1; R[idx] = -1; idx++; }
+                        for (let i = 0; i < P; i++) { L[idx] = 1; R[idx] = 1; idx++; }
+                    }
+                    for (let i = 0; i < P; i++) { L[idx] = 0; R[idx] = 0; idx++; }
+                }
+
+                const row = ln * 2 + this.field;
+                const srcRow = Math.floor((row / this.lines) * (srcHeight - 1));
+                const rowBase = srcRow * srcWidth * 4;
+                const useCb = (ln & 1) === 0;
+
+                for (let x = 0; x < W; x++) {
+                    const srcX = ((x * (srcWidth - 1)) / W) | 0;
+                    const sIdx = rowBase + srcX * 4;
+                    const r = frameData[sIdx];
+                    const g = frameData[sIdx + 1];
+                    const b = frameData[sIdx + 2];
+                    const y = 0.299 * r + 0.587 * g + 0.114 * b;
+                    const c = useCb
+                        ? (-0.168736 * r - 0.331264 * g + 0.5 * b + 128)
+                        : (0.5 * r - 0.418688 * g - 0.081312 * b + 128);
+                    L[idx] = y * (1 / 255) - 0.5;
+                    R[idx] = c * (1 / 255) - 0.5;
+                    idx++;
+                }
+                for (let i = 0; i < P; i++) { L[idx] = 0; R[idx] = 0; idx++; }
+            }
+
+            // idx === oversampledSize at this point; downsample.
+            this.resampleInto(L, idx, this.outLeft);
+            this.resampleInto(R, idx, this.outRight);
+
+            this.field = 1 - this.field;
+            const outLen = Math.ceil(idx / this.oversample);
+            return {
+                left: this.outLeft.subarray(0, outLen),
+                right: this.outRight.subarray(0, outLen)
+            };
+        }
+
+        resampleInto(src, srcLen, out) {
+            const factor = this.oversample;
+            const taps = this.filterTaps;
+            const filter = this.filter;
+            const halfTaps = this.filterHalf;
+            const outLen = Math.ceil(srcLen / factor);
+
+            for (let i = 0; i < outLen; i++) {
+                let val = 0;
+                const center = i * factor;
+                const base = center - halfTaps;
+                const hi = base + taps;
+                if (base >= 0 && hi <= srcLen) {
+                    // Fast path: no edge mirroring needed.
+                    for (let j = 0; j < taps; j++) val += src[base + j] * filter[j];
+                } else {
+                    for (let j = 0; j < taps; j++) {
+                        let sIdx = base + j;
+                        if (sIdx < 0) sIdx = Math.min(-sIdx, srcLen - 1);
+                        else if (sIdx >= srcLen) sIdx = Math.max(0, 2 * srcLen - 2 - sIdx);
+                        val += src[sIdx] * filter[j];
+                    }
                 }
                 out[i] = val;
             }
-            return out;
-        }
-        
-        encodeFrame(frameData, width, height) {
-            this.leftBuffer = [];
-            this.rightBuffer = [];
-            
-            const pulse = new Float64Array(this.pulseLengthSamples).fill(1.0);
-            const negPulse = new Float64Array(this.pulseLengthSamples).fill(-1.0);
-            const quiet = new Float64Array(this.pulseLengthSamples).fill(0.0);
-            
-            // Field sync
-            if (this.field === 0) {
-                this.leftBuffer.push(...negPulse, ...pulse);
-                this.rightBuffer.push(...pulse, ...negPulse);
-            } else {
-                this.leftBuffer.push(...pulse, ...negPulse);
-                this.rightBuffer.push(...negPulse, ...pulse);
-            }
-            this.leftBuffer.push(...quiet);
-            this.rightBuffer.push(...quiet);
-            
-            const halfLines = Math.floor(this.lines / 2);
-            const srcHeight = Math.min(height, this.lines);
-            const srcWidth = Math.min(width, this.widthPixels);
-            
-            for (let ln = 0; ln < halfLines; ln++) {
-                if (ln !== 0) {
-                    if (ln % 2 === 0) {
-                        this.leftBuffer.push(...pulse, ...negPulse);
-                        this.rightBuffer.push(...pulse, ...negPulse);
-                    } else {
-                        this.leftBuffer.push(...negPulse, ...pulse);
-                        this.rightBuffer.push(...negPulse, ...pulse);
-                    }
-                    this.leftBuffer.push(...quiet);
-                    this.rightBuffer.push(...quiet);
-                }
-                
-                const row = ln * 2 + this.field;
-                const srcRow = Math.floor((row / this.lines) * (srcHeight - 1));
-                
-                const yArr = new Float64Array(this.widthPixels);
-                const cArr = new Float64Array(this.widthPixels);
-                
-                for (let x = 0; x < this.widthPixels; x++) {
-                    const srcX = Math.floor((x / this.widthPixels) * (srcWidth - 1));
-                    const idx = (srcRow * srcWidth + srcX) * 4;
-                    const r = frameData[idx], g = frameData[idx + 1], b = frameData[idx + 2];
-                    const [y, cb, cr] = this.rgbToYcbcr(r, g, b);
-                    
-                    yArr[x] = y / 255.0 - 0.5;
-                    cArr[x] = (ln % 2 === 0 ? cb : cr) / 255.0 - 0.5;
-                }
-                
-                this.leftBuffer.push(...yArr);
-                this.rightBuffer.push(...cArr);
-                this.leftBuffer.push(...quiet);
-                this.rightBuffer.push(...quiet);
-            }
-            
-            const leftBuilt = new Float64Array(this.leftBuffer);
-            const rightBuilt = new Float64Array(this.rightBuffer);
-            
-            const resampledLeft = this.resamplePoly(leftBuilt, this.oversample);
-            const resampledRight = this.resamplePoly(rightBuilt, this.oversample);
-            
-            this.field = 1 - this.field;
-            
-            return {
-                left: resampledLeft,
-                right: resampledRight
-            };
         }
     }
-    
+
     // ============================================
     // SLOWSCAN DECODER - Converts stereo audio back to video
+    // Sample loop is sequential by nature (feedback AGC + sync tracking),
+    // so it stays on CPU. All per-sample allocations have been eliminated:
+    // chromaDelay, noise, and per-line color arrays are preallocated.
+    // Rendering is delegated to a pluggable renderer (WebGL preferred).
     // ============================================
+    const DECODER_MAX_COLORS_PER_LINE = 1024;
+    const DECODER_LINE_POOL_MAX = 1024;
+
     class SlowscanDecoder {
         constructor(config = {}) {
             const defaults = {
@@ -224,170 +249,205 @@
                 hFreq: 225.0,
                 vFreq: 3
             };
-            
             const cfg = { ...defaults, ...config };
             this.bufferSize = cfg.bufferSize;
             this.sig = { LMin: 0.0, LMax: 1.0, CMin: -1.0, CMax: 1.0 };
             this.hPhase = 0;
             this.vPhase = 0;
-            
+
             this.pulse = { time: 0, timeout: 0, luma: 0, lumaPrev: 0, chroma: 0, chromaPrev: 0, changed: false, ready: false };
             this.timing = { time: 0, lastV: 0, lastH: 0 };
             this.field = 0;
             this.chromaField = 0;
-            this.chromaDelay = [];
             this.chromaDelayIndex = 0;
             this.lines = [];
-            this.currLine = { x1: 0, y: 0, x2: 0, maxPhase: 0, colors: [] };
+            this.linePool = [];
             this.lastClear = 0;
             this.clearInterval = cfg.clearInterval;
             this.overScan = cfg.overScan;
             this.hOffset = cfg.hOffset;
             this.pulseLength = cfg.pulseLength;
-            
+
             this.canvas = config.canvas;
-            this.ctx = this.canvas.getContext('2d');
             this.width = this.canvas.width;
             this.height = this.canvas.height;
             this.lineWidth = cfg.lineWidth;
             this.blend = cfg.blend;
             this.brightness = cfg.brightness;
             this.saturation = cfg.saturation;
-            
+
             this.audioCtx = config.audioCtx || new (window.AudioContext || window.webkitAudioContext)();
             this.sampleRate = this.audioCtx.sampleRate;
             this.hFreqTarget = 1.0 / cfg.hFreq * this.sampleRate;
             this.vFreqTarget = 1.0 / cfg.vFreq * this.sampleRate;
             this.hFreq = this.hFreqTarget;
             this.vFreq = this.vFreqTarget;
-            
+
+            // Preallocated chroma delay line (one scanline worth of samples).
+            this.chromaDelayMax = Math.ceil(this.sampleRate / 10.0) + 16;
+            this.chromaDelay = new Float32Array(this.chromaDelayMax);
+
+            // Cheap pseudo-noise LUT reused across samples. Math.random() in the
+            // hot loop was a measurable cost; decorrelated indices avoid giving
+            // L and C identical jitter.
+            this.noiseLUTSize = 4096;
+            this.noiseLUT = new Float32Array(this.noiseLUTSize);
+            for (let i = 0; i < this.noiseLUTSize; i++) {
+                this.noiseLUT[i] = Math.random() * 0.01 - 0.005;
+            }
+            this.noiseIdxL = 0;
+            this.noiseIdxC = this.noiseLUTSize >> 1;
+
+            this.currLine = this.acquireLine();
+
+            this.renderer = null;
+            try {
+                this.renderer = new WebGLPhosphor(this.canvas);
+            } catch (e) {
+                console.warn('[SlowscanJam] WebGL unavailable, using 2D fallback:', e.message);
+                this.renderer = new Canvas2DPhosphor(this.canvas);
+            }
+
             this.requestID = null;
+            this.draw = this.draw.bind(this);
             this.draw();
         }
-        
-        activate() {
-            this.audioCtx.resume();
+
+        activate() { this.audioCtx.resume(); }
+
+        acquireLine() {
+            const l = this.linePool.pop();
+            if (l) { l.count = 0; return l; }
+            return {
+                x1: 0, y: 0, x2: 0, maxPhase: 0, count: 0,
+                phase: new Float32Array(DECODER_MAX_COLORS_PER_LINE),
+                rgb: new Uint8Array(DECODER_MAX_COLORS_PER_LINE * 3)
+            };
         }
-        
-        hPhaseToX(hPhase, vPhase, field) {
+
+        releaseLine(l) {
+            if (this.linePool.length < DECODER_LINE_POOL_MAX) {
+                this.linePool.push(l);
+            }
+        }
+
+        hPhaseToX(hPhase) {
             return ((hPhase - this.hOffset) / this.overScan) * this.width;
         }
-        
-        vPhaseToY(hPhase, vPhase, field) {
+        vPhaseToY(vPhase, field) {
             return (vPhase + (field / this.vFreq) * this.hFreq * 0.5) * this.height;
         }
-        
-        YCbCrToRGB(y, cb, cr) {
-            let r = y + 45 * cr / 32;
-            let g = y - (11 * cb + 23 * cr) / 32;
-            let b = y + 113 * cb / 64;
-            return [r, g, b];
-        }
-        
+
         process(lSamples, cSamples) {
             const sampleRate = this.sampleRate;
+            const sRateInv = 1.0 / sampleRate;
             const s = this.sig;
             const p = this.pulse;
-            
-            for (let i = 0; i < lSamples.length; i++) {
+            const nLUT = this.noiseLUT;
+            const nMask = this.noiseLUTSize - 1;
+            const chromaDelay = this.chromaDelay;
+            const chromaDelayCap = (sampleRate / 10.0) | 0;
+            const invOverScan = 1.0 / this.overScan;
+            const widthPx = this.width;
+            const halfPulse = this.pulseLength * 0.5;
+            const brightness = this.brightness;
+            const saturation = this.saturation;
+
+            const n = lSamples.length;
+            for (let i = 0; i < n; i++) {
                 this.timing.time += 1;
-                
-                let lSample = lSamples[i] + Math.random() * 0.01 - 0.005;
-                let cSample = cSamples[i] + Math.random() * 0.01 - 0.005;
-                
+
+                const lSample = lSamples[i] + nLUT[(this.noiseIdxL = (this.noiseIdxL + 1) & nMask)];
+                const cSample = cSamples[i] + nLUT[(this.noiseIdxC = (this.noiseIdxC + 1) & nMask)];
+
                 if (lSample < s.LMin) s.LMin = lSample;
                 if (lSample > s.LMax) s.LMax = lSample;
-                s.LMin *= 1.0 - (1.0 / sampleRate);
-                s.LMax *= 1.0 - (1.0 / sampleRate);
+                s.LMin *= 1.0 - sRateInv;
+                s.LMax *= 1.0 - sRateInv;
                 if (s.LMin > -0.025) s.LMin = -0.025;
                 if (s.LMax < 0.025) s.LMax = 0.025;
-                
+
                 if (cSample < s.CMin) s.CMin = cSample;
                 if (cSample > s.CMax) s.CMax = cSample;
-                s.CMin *= 1.0 - (1.0 / sampleRate);
-                s.CMax *= 1.0 - (1.0 / sampleRate);
+                s.CMin *= 1.0 - sRateInv;
+                s.CMax *= 1.0 - sRateInv;
                 if (s.CMin > -0.05) s.CMin = -0.05;
                 if (s.CMax < 0.05) s.CMax = 0.05;
-                
-                let luma = (lSample * 2.0 - s.LMin) / (s.LMax - s.LMin) * this.brightness * 255;
-                let chroma = (cSample * 2.0 - s.CMin) / (s.CMax - s.CMin) * this.saturation * 255;
-                let chromaLast = this.chromaDelay[this.chromaDelayIndex] || 0;
-                
-                if (this.chromaDelayIndex < sampleRate / 10.0) {
-                    this.chromaDelay[this.chromaDelayIndex] = chroma;
+
+                const luma = (lSample * 2.0 - s.LMin) / (s.LMax - s.LMin) * brightness * 255;
+                let chroma = (cSample * 2.0 - s.CMin) / (s.CMax - s.CMin) * saturation * 255;
+                let chromaLast = chromaDelay[this.chromaDelayIndex];
+
+                if (this.chromaDelayIndex < chromaDelayCap) {
+                    chromaDelay[this.chromaDelayIndex] = chroma;
                     this.chromaDelayIndex++;
                 }
-                
+
                 chroma -= 128;
                 chromaLast -= 128;
-                
-                let r, g, b;
-                if (this.chromaField === 0) {
-                    [r, g, b] = this.YCbCrToRGB(luma, chromaLast, chroma);
-                } else {
-                    [r, g, b] = this.YCbCrToRGB(luma, chroma, chromaLast);
+
+                // Inline YCbCr->RGB to avoid per-sample array allocation.
+                let cb, cr;
+                if (this.chromaField === 0) { cb = chromaLast; cr = chroma; }
+                else { cb = chroma; cr = chromaLast; }
+                let r = luma + 45 * cr / 32;
+                let g = luma - (11 * cb + 23 * cr) / 32;
+                let b = luma + 113 * cb / 64;
+                if (r < 0) r = 0; else if (r > 255) r = 255;
+                if (g < 0) g = 0; else if (g > 255) g = 255;
+                if (b < 0) b = 0; else if (b > 255) b = 255;
+
+                const cl = this.currLine;
+                if (cl.count < DECODER_MAX_COLORS_PER_LINE) {
+                    const n2 = cl.count;
+                    cl.phase[n2] = this.hPhase;
+                    const ro = n2 * 3;
+                    cl.rgb[ro] = r | 0;
+                    cl.rgb[ro + 1] = g | 0;
+                    cl.rgb[ro + 2] = b | 0;
+                    cl.count = n2 + 1;
                 }
-                
-                if (this.currLine.colors.length < 1024) {
-                    this.currLine.colors.push({
-                        phase: this.hPhase,
-                        r: Math.max(Math.min(Math.round(r), 255), 0),
-                        g: Math.max(Math.min(Math.round(g), 255), 0),
-                        b: Math.max(Math.min(Math.round(b), 255), 0)
-                    });
-                }
-                
-                this.currLine.maxPhase = this.hPhase;
+                cl.maxPhase = this.hPhase;
+
                 this.hPhase += 1.0 / this.hFreq;
                 this.vPhase += 1.0 / this.vFreq;
-                this.currLine.x2 = this.hPhaseToX(this.hPhase, this.vPhase, this.field);
-                
+                cl.x2 = (this.hPhase - this.hOffset) * invOverScan * widthPx;
+
                 let blank = false;
-                
+
                 if ((s.LMax - s.LMin) > 0.1 && (s.CMax - s.CMin) > 0.1) {
-                    if (lSample < s.LMin * 0.5) p.luma = -1;
-                    else if (lSample > s.LMax * 0.5) p.luma = 1;
-                    else p.luma = 0;
-                    
-                    if (cSample < s.CMin * 0.5) p.chroma = -1;
-                    else if (cSample > s.CMax * 0.5) p.chroma = 1;
-                    else p.chroma = 0;
-                    
+                    p.luma = lSample < s.LMin * 0.5 ? -1 : (lSample > s.LMax * 0.5 ? 1 : 0);
+                    p.chroma = cSample < s.CMin * 0.5 ? -1 : (cSample > s.CMax * 0.5 ? 1 : 0);
+
                     if (p.luma !== p.lumaPrev || p.chroma !== p.chromaPrev) {
                         p.time = 0;
                         p.lumaPrev = p.luma;
                         p.chromaPrev = p.chroma;
                         p.changed = true;
                     }
-                    
+
                     if (p.luma !== 0 && p.chroma !== 0) {
-                        p.time += 1.0 / sampleRate;
-                        
-                        if (p.time > this.pulseLength * 0.5 && p.changed) {
+                        p.time += sRateInv;
+                        if (p.time > halfPulse && p.changed) {
                             p.changed = false;
-                            
                             if (!p.ready) {
                                 p.ready = true;
                                 p.timeout = this.pulseLength * 1.25;
                             } else {
                                 p.ready = false;
                                 blank = true;
-                                
-                                if ((this.timing.time - this.timing.lastH < this.hFreqTarget * 1.5) &&
-                                    (this.timing.time - this.timing.lastH > this.hFreqTarget * 0.5)) {
-                                    this.hFreq = this.hFreq * 0.9 + (this.timing.time - this.timing.lastH) * 0.1;
+                                const dH = this.timing.time - this.timing.lastH;
+                                if (dH < this.hFreqTarget * 1.5 && dH > this.hFreqTarget * 0.5) {
+                                    this.hFreq = this.hFreq * 0.9 + dH * 0.1;
                                 }
-                                
                                 this.timing.lastH = this.timing.time;
                                 this.hPhase = 0;
                                 this.chromaDelayIndex = 0;
-                                
                                 this.chromaField = p.luma > 0 ? 0 : 1;
-                                
                                 if (p.luma !== p.chroma) {
-                                    if ((this.timing.time - this.timing.lastV < this.vFreqTarget * 1.5) &&
-                                        (this.timing.time - this.timing.lastV > this.vFreqTarget * 0.5)) {
-                                        this.vFreq = this.vFreq * 0.75 + (this.timing.time - this.timing.lastV) * 0.25;
+                                    const dV = this.timing.time - this.timing.lastV;
+                                    if (dV < this.vFreqTarget * 1.5 && dV > this.vFreqTarget * 0.5) {
+                                        this.vFreq = this.vFreq * 0.75 + dV * 0.25;
                                     }
                                     this.timing.lastV = this.timing.time;
                                     this.vPhase = 0;
@@ -398,80 +458,276 @@
                         }
                     }
                 }
-                
-                this.hFreq = this.hFreq * (1.0 - 1.0 / sampleRate) + this.hFreqTarget * (1.0 / sampleRate);
-                this.vFreq = this.vFreq * (1.0 - 1.0 / sampleRate) + this.vFreqTarget * (1.0 / sampleRate);
-                
+
+                this.hFreq = this.hFreq * (1.0 - sRateInv) + this.hFreqTarget * sRateInv;
+                this.vFreq = this.vFreq * (1.0 - sRateInv) + this.vFreqTarget * sRateInv;
+
                 if (this.hPhase >= 1.0) {
                     blank = true;
                     this.hPhase -= 1.0;
                     this.chromaDelayIndex = 0;
                     this.chromaField = this.chromaField === 1 ? 0 : 1;
                 }
-                
                 if (this.vPhase >= 1.0) {
                     blank = true;
                     this.vPhase -= 1.0;
                     this.field = this.field === 0 ? 1 : 0;
                 }
-                
+
                 if (blank) {
-                    if (this.lines.length < 1024 && this.currLine.colors.length > 5 && this.currLine.maxPhase > 0) {
-                        this.lines.push(this.currLine);
+                    if (this.lines.length < 1024 && cl.count > 5 && cl.maxPhase > 0) {
+                        this.lines.push(cl);
+                    } else {
+                        this.releaseLine(cl);
                     }
-                    
-                    this.currLine = {
-                        x1: this.hPhaseToX(this.hPhase, this.vPhase, this.field),
-                        y: this.vPhaseToY(this.hPhase, this.vPhase, this.field),
-                        x2: 0,
-                        maxPhase: 0,
-                        colors: []
-                    };
-                    blank = false;
+                    const nl = this.acquireLine();
+                    nl.x1 = (this.hPhase - this.hOffset) * invOverScan * widthPx;
+                    nl.y = (this.vPhase + (this.field / this.vFreq) * this.hFreq * 0.5) * this.height;
+                    nl.x2 = 0;
+                    nl.maxPhase = 0;
+                    this.currLine = nl;
                 }
             }
         }
-        
+
         draw() {
-            this.requestID = requestAnimationFrame(() => this.draw());
-            
+            this.requestID = requestAnimationFrame(this.draw);
+
             if (Date.now() - this.lastClear > this.clearInterval) {
-                this.ctx.fillStyle = 'rgba(0,0,0,0.05)';
-                this.ctx.globalCompositeOperation = 'source-over';
-                this.ctx.fillRect(0, 0, this.width, this.height);
+                this.renderer.fade(0.05);
                 this.lastClear = Date.now();
             }
-            
-            if (this.blend) {
-                this.ctx.globalCompositeOperation = 'screen';
-            }
-            
-            this.ctx.lineWidth = this.lineWidth;
-            
-            for (let line of this.lines) {
-                const grd = this.ctx.createLinearGradient(line.x1, line.y, line.x2, line.y);
-                
-                for (let color of line.colors) {
-                    grd.addColorStop(color.phase / line.maxPhase, `rgb(${color.r},${color.g},${color.b})`);
-                }
-                
-                this.ctx.beginPath();
-                this.ctx.moveTo(line.x1 + Math.random() * 2.0 - 1.0, line.y + Math.random() * 2.0 - 1.0);
-                this.ctx.lineTo(line.x2 + Math.random() * 2.0 - 1.0, line.y + Math.random() * 2.0 - 1.0);
-                this.ctx.strokeStyle = grd;
-                this.ctx.stroke();
-            }
-            
-            this.lines = [];
+
+            this.renderer.drawLines(this.lines, this.lineWidth, this.blend);
+
+            for (let i = 0; i < this.lines.length; i++) this.releaseLine(this.lines[i]);
+            this.lines.length = 0;
         }
-        
+
         stop() {
-            if (this.requestID) {
-                cancelAnimationFrame(this.requestID);
+            if (this.requestID) cancelAnimationFrame(this.requestID);
+        }
+    }
+
+    // ============================================
+    // WEBGL PHOSPHOR RENDERER
+    // Each scanline becomes a triangle strip quad whose vertices carry
+    // per-sample RGB. The GPU rasterizes gradients instead of the CPU
+    // building many-stop linearGradients per line. Blend mode uses
+    // additive (ONE, ONE) to approximate the original 'screen' glow.
+    // ============================================
+    class WebGLPhosphor {
+        constructor(canvas) {
+            this.canvas = canvas;
+            const gl = canvas.getContext('webgl', { alpha: false, premultipliedAlpha: false, preserveDrawingBuffer: true, antialias: true });
+            if (!gl) throw new Error('WebGL context unavailable');
+            this.gl = gl;
+
+            this.lineProg = this._program(
+                `attribute vec2 a_pos;
+                 attribute vec3 a_col;
+                 uniform vec2 u_res;
+                 varying vec3 v_col;
+                 void main() {
+                     vec2 clip = (a_pos / u_res) * 2.0 - 1.0;
+                     clip.y = -clip.y;
+                     gl_Position = vec4(clip, 0.0, 1.0);
+                     v_col = a_col;
+                 }`,
+                `precision mediump float;
+                 varying vec3 v_col;
+                 void main() { gl_FragColor = vec4(v_col, 1.0); }`
+            );
+            this.lineLoc = {
+                pos: gl.getAttribLocation(this.lineProg, 'a_pos'),
+                col: gl.getAttribLocation(this.lineProg, 'a_col'),
+                res: gl.getUniformLocation(this.lineProg, 'u_res')
+            };
+
+            this.fadeProg = this._program(
+                `attribute vec2 a_pos;
+                 void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }`,
+                `precision mediump float;
+                 uniform vec4 u_color;
+                 void main() { gl_FragColor = u_color; }`
+            );
+            this.fadeLoc = {
+                pos: gl.getAttribLocation(this.fadeProg, 'a_pos'),
+                color: gl.getUniformLocation(this.fadeProg, 'u_color')
+            };
+
+            this.lineBuf = gl.createBuffer();
+            this.fadeBuf = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, this.fadeBuf);
+            gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+
+            // 5 floats per vertex (x, y, r, g, b); 2 vertices per color sample.
+            this.vertexData = new Float32Array(64 * 1024 * 5);
+            this.lineStarts = new Int32Array(2048);
+            this.lineCounts = new Int32Array(2048);
+
+            gl.viewport(0, 0, canvas.width, canvas.height);
+            gl.disable(gl.DEPTH_TEST);
+            gl.clearColor(0, 0, 0, 1);
+            gl.clear(gl.COLOR_BUFFER_BIT);
+        }
+
+        _shader(type, src) {
+            const gl = this.gl;
+            const s = gl.createShader(type);
+            gl.shaderSource(s, src);
+            gl.compileShader(s);
+            if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+                const log = gl.getShaderInfoLog(s);
+                gl.deleteShader(s);
+                throw new Error('shader: ' + log);
+            }
+            return s;
+        }
+
+        _program(vs, fs) {
+            const gl = this.gl;
+            const p = gl.createProgram();
+            gl.attachShader(p, this._shader(gl.VERTEX_SHADER, vs));
+            gl.attachShader(p, this._shader(gl.FRAGMENT_SHADER, fs));
+            gl.linkProgram(p);
+            if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+                throw new Error('link: ' + gl.getProgramInfoLog(p));
+            }
+            return p;
+        }
+
+        fade(alpha) {
+            const gl = this.gl;
+            gl.useProgram(this.fadeProg);
+            gl.bindBuffer(gl.ARRAY_BUFFER, this.fadeBuf);
+            gl.enableVertexAttribArray(this.fadeLoc.pos);
+            gl.vertexAttribPointer(this.fadeLoc.pos, 2, gl.FLOAT, false, 0, 0);
+            gl.uniform4f(this.fadeLoc.color, 0, 0, 0, alpha);
+            gl.enable(gl.BLEND);
+            gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+            gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        }
+
+        drawLines(lines, lineWidth, blend) {
+            const gl = this.gl;
+            if (lines.length === 0) return;
+
+            const halfW = lineWidth * 0.5;
+            let vd = this.vertexData;
+            let vi = 0;
+            let lineIdx = 0;
+
+            for (let li = 0; li < lines.length; li++) {
+                const line = lines[li];
+                const count = line.count;
+                if (count < 2 || line.maxPhase <= 0) continue;
+
+                const needed = count * 2 * 5;
+                if (vi + needed > vd.length) {
+                    const grown = new Float32Array(Math.max(vd.length * 2, vi + needed));
+                    grown.set(vd.subarray(0, vi));
+                    this.vertexData = grown;
+                    vd = grown;
+                }
+
+                const invMaxPhase = 1.0 / line.maxPhase;
+                const dx = line.x2 - line.x1;
+                const jx = Math.random() * 2 - 1;
+                const jy = Math.random() * 2 - 1;
+                const y = line.y + jy;
+                const y1 = y - halfW;
+                const y2 = y + halfW;
+                const phase = line.phase;
+                const rgb = line.rgb;
+                const inv255 = 1 / 255;
+
+                const start = vi / 5;
+                for (let i = 0; i < count; i++) {
+                    const x = line.x1 + dx * phase[i] * invMaxPhase + jx;
+                    const ro = i * 3;
+                    const r = rgb[ro] * inv255;
+                    const g = rgb[ro + 1] * inv255;
+                    const b = rgb[ro + 2] * inv255;
+                    vd[vi++] = x; vd[vi++] = y1; vd[vi++] = r; vd[vi++] = g; vd[vi++] = b;
+                    vd[vi++] = x; vd[vi++] = y2; vd[vi++] = r; vd[vi++] = g; vd[vi++] = b;
+                }
+                if (lineIdx >= this.lineStarts.length) {
+                    const ns = new Int32Array(this.lineStarts.length * 2);
+                    const nc = new Int32Array(this.lineCounts.length * 2);
+                    ns.set(this.lineStarts); nc.set(this.lineCounts);
+                    this.lineStarts = ns; this.lineCounts = nc;
+                }
+                this.lineStarts[lineIdx] = start;
+                this.lineCounts[lineIdx] = count * 2;
+                lineIdx++;
+            }
+            if (lineIdx === 0) return;
+
+            gl.useProgram(this.lineProg);
+            gl.bindBuffer(gl.ARRAY_BUFFER, this.lineBuf);
+            gl.bufferData(gl.ARRAY_BUFFER, vd.subarray(0, vi), gl.DYNAMIC_DRAW);
+
+            const stride = 5 * 4;
+            gl.enableVertexAttribArray(this.lineLoc.pos);
+            gl.vertexAttribPointer(this.lineLoc.pos, 2, gl.FLOAT, false, stride, 0);
+            gl.enableVertexAttribArray(this.lineLoc.col);
+            gl.vertexAttribPointer(this.lineLoc.col, 3, gl.FLOAT, false, stride, 8);
+            gl.uniform2f(this.lineLoc.res, this.canvas.width, this.canvas.height);
+
+            gl.enable(gl.BLEND);
+            if (blend) gl.blendFunc(gl.ONE, gl.ONE);
+            else gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+            for (let i = 0; i < lineIdx; i++) {
+                gl.drawArrays(gl.TRIANGLE_STRIP, this.lineStarts[i], this.lineCounts[i]);
             }
         }
     }
-    
+
+    // 2D fallback when WebGL is unavailable. Decimates gradient stops so
+    // createLinearGradient stays fast even with ~200 color samples per line.
+    class Canvas2DPhosphor {
+        constructor(canvas) {
+            this.canvas = canvas;
+            this.ctx = canvas.getContext('2d');
+            this.width = canvas.width;
+            this.height = canvas.height;
+        }
+        fade(alpha) {
+            this.ctx.globalCompositeOperation = 'source-over';
+            this.ctx.fillStyle = `rgba(0,0,0,${alpha})`;
+            this.ctx.fillRect(0, 0, this.width, this.height);
+        }
+        drawLines(lines, lineWidth, blend) {
+            const ctx = this.ctx;
+            ctx.globalCompositeOperation = blend ? 'screen' : 'source-over';
+            ctx.lineWidth = lineWidth;
+            const MAX_STOPS = 32;
+            for (let li = 0; li < lines.length; li++) {
+                const line = lines[li];
+                if (line.count < 2 || line.maxPhase <= 0) continue;
+                const grd = ctx.createLinearGradient(line.x1, line.y, line.x2, line.y);
+                const count = line.count;
+                const stride = Math.max(1, Math.floor(count / MAX_STOPS));
+                const invMax = 1.0 / line.maxPhase;
+                for (let i = 0; i < count; i += stride) {
+                    let t = line.phase[i] * invMax;
+                    if (t < 0) t = 0; else if (t > 1) t = 1;
+                    const ro = i * 3;
+                    grd.addColorStop(t, `rgb(${line.rgb[ro]},${line.rgb[ro+1]},${line.rgb[ro+2]})`);
+                }
+                const lo = (count - 1) * 3;
+                grd.addColorStop(1, `rgb(${line.rgb[lo]},${line.rgb[lo+1]},${line.rgb[lo+2]})`);
+                ctx.beginPath();
+                ctx.moveTo(line.x1 + Math.random() * 2 - 1, line.y + Math.random() * 2 - 1);
+                ctx.lineTo(line.x2 + Math.random() * 2 - 1, line.y + Math.random() * 2 - 1);
+                ctx.strokeStyle = grd;
+                ctx.stroke();
+            }
+        }
+    }
+
     // ============================================
     // MAIN APPLICATION
     // ============================================
@@ -480,27 +736,53 @@
     const decodedCanvas = document.getElementById('decoded');
     const startBtn = document.getElementById('startBtn');
     const statusEl = document.getElementById('status');
-    
-    const sourceCtx = sourceCanvas.getContext('2d');
+
+    // willReadFrequently hints the backing store to stay CPU-side so
+    // getImageData avoids GPU->CPU readback each frame.
+    const sourceCtx = sourceCanvas.getContext('2d', { willReadFrequently: true });
     const encodedCtx = encodedCanvas.getContext('2d');
-    
+
     let video = null;
     let encoder = null;
     let decoder = null;
     let audioCtx = null;
     let audioOutputNode = null;
     let isRunning = false;
-    let audioQueue = { left: [], right: [] };
-    let audioQueueReadIndex = 0;
+
+    // Power-of-two ring buffer for audio playback queue. Replaces JS arrays
+    // that were grown via push() and periodically .slice()'d (O(n) churn).
+    const AUDIO_QUEUE_SIZE = 1 << 18; // 262144, ~2.7s at 96k
+    const AUDIO_QUEUE_MASK = AUDIO_QUEUE_SIZE - 1;
+    const audioQueueL = new Float32Array(AUDIO_QUEUE_SIZE);
+    const audioQueueR = new Float32Array(AUDIO_QUEUE_SIZE);
+    let audioWrite = 0;
+    let audioRead = 0;
+
+    function enqueueAudio(left, right) {
+        const n = left.length;
+        let w = audioWrite;
+        for (let i = 0; i < n; i++) {
+            audioQueueL[w] = left[i];
+            audioQueueR[w] = right[i];
+            w = (w + 1) & AUDIO_QUEUE_MASK;
+        }
+        audioWrite = w;
+        // If the producer laps the consumer, slide the read head forward
+        // so we drop the oldest samples rather than corrupting ordering.
+        const occupancy = (audioWrite - audioRead) & AUDIO_QUEUE_MASK;
+        if (occupancy > AUDIO_QUEUE_SIZE - 4096) {
+            audioRead = (audioWrite - (AUDIO_QUEUE_SIZE - 4096)) & AUDIO_QUEUE_MASK;
+        }
+    }
 
     function init() {
         const fps = parseFloat(document.getElementById('fps').value);
         const lines = parseInt(document.getElementById('lines').value);
         const pulseLength = 0.2 / 1000;
-        
+
         const hTime = (1 / fps / lines) * 2;
         const widthSamples = hTime - (pulseLength * 4);
-        
+
         const hFreq = 1.0 / hTime;
         const vFreq = fps;
         const overScan = widthSamples / hTime;
@@ -532,45 +814,40 @@
         if (!audioCtx) {
             audioCtx = decoder.audioCtx;
 
-            // Create ScriptProcessorNode for continuous audio output
             audioOutputNode = audioCtx.createScriptProcessor(2048, 0, 2);
             audioOutputNode.onaudioprocess = function(e) {
-                const leftOut = e.outputBuffer.getChannelData(0);
-                const rightOut = e.outputBuffer.getChannelData(1);
-
-                for (let i = 0; i < leftOut.length; i++) {
-                    if (audioQueueReadIndex < audioQueue.left.length) {
-                        leftOut[i] = audioQueue.left[audioQueueReadIndex] * 0.5;
-                        rightOut[i] = audioQueue.right[audioQueueReadIndex] * 0.5;
-                        audioQueueReadIndex++;
+                const L = e.outputBuffer.getChannelData(0);
+                const R = e.outputBuffer.getChannelData(1);
+                const len = L.length;
+                let r = audioRead;
+                let avail = (audioWrite - r) & AUDIO_QUEUE_MASK;
+                for (let i = 0; i < len; i++) {
+                    if (avail > 0) {
+                        L[i] = audioQueueL[r] * 0.5;
+                        R[i] = audioQueueR[r] * 0.5;
+                        r = (r + 1) & AUDIO_QUEUE_MASK;
+                        avail--;
                     } else {
-                        leftOut[i] = 0;
-                        rightOut[i] = 0;
+                        L[i] = 0;
+                        R[i] = 0;
                     }
                 }
-
-                // Trim consumed samples from queue periodically
-                if (audioQueueReadIndex > 48000) {
-                    audioQueue.left = audioQueue.left.slice(audioQueueReadIndex);
-                    audioQueue.right = audioQueue.right.slice(audioQueueReadIndex);
-                    audioQueueReadIndex = 0;
-                }
+                audioRead = r;
             };
             audioOutputNode.connect(audioCtx.destination);
         }
     }
-    
+
     function visualizeEncoded(left, right) {
         const w = encodedCanvas.width;
         const h = encodedCanvas.height;
-        const step = Math.ceil(left.length / w);
-        
+        const step = Math.max(1, Math.ceil(left.length / w));
+
         encodedCtx.fillStyle = '#000';
         encodedCtx.fillRect(0, 0, w, h);
-        
+
         encodedCtx.beginPath();
-        for (let x = 0; x < left.length; x += step) {
-            const px = Math.floor(x / step);
+        for (let x = 0, px = 0; x < left.length; x += step, px++) {
             const py = (left[x] + 0.5) * h * 0.5;
             if (px === 0) encodedCtx.moveTo(px, py);
             else encodedCtx.lineTo(px, py);
@@ -578,10 +855,9 @@
         encodedCtx.strokeStyle = '#0f0';
         encodedCtx.lineWidth = 1;
         encodedCtx.stroke();
-        
+
         encodedCtx.beginPath();
-        for (let x = 0; x < right.length; x += step) {
-            const px = Math.floor(x / step);
+        for (let x = 0, px = 0; x < right.length; x += step, px++) {
             const py = (right[x] + 0.5) * h * 0.5 + h * 0.5;
             if (px === 0) encodedCtx.moveTo(px, py);
             else encodedCtx.lineTo(px, py);
@@ -590,37 +866,32 @@
         encodedCtx.lineWidth = 1;
         encodedCtx.stroke();
     }
-    
-    // UI Control handlers
+
+    // UI handlers
     document.getElementById('lines').addEventListener('input', function() {
         document.getElementById('linesVal').textContent = this.value;
         if (isRunning) init();
     });
-    
     document.getElementById('fps').addEventListener('input', function() {
         document.getElementById('fpsVal').textContent = this.value;
         if (isRunning) init();
     });
-    
     document.getElementById('lineWidth').addEventListener('input', function() {
         document.getElementById('lineWidthVal').textContent = this.value;
         if (decoder) decoder.lineWidth = parseFloat(this.value);
     });
-    
     document.getElementById('brightness').addEventListener('input', function() {
         document.getElementById('brightnessVal').textContent = this.value;
         if (decoder) decoder.brightness = parseFloat(this.value);
     });
-    
     document.getElementById('saturation').addEventListener('input', function() {
         document.getElementById('saturationVal').textContent = this.value;
         if (decoder) decoder.saturation = parseFloat(this.value);
     });
-    
     document.getElementById('blend').addEventListener('change', function() {
         if (decoder) decoder.blend = this.checked;
     });
-    
+
     async function startCamera() {
         try {
             video = document.createElement('video');
@@ -628,16 +899,12 @@
             video.height = sourceCanvas.height;
             video.autoplay = true;
             video.playsInline = true;
-            
             const stream = await navigator.mediaDevices.getUserMedia({
                 video: { width: 320, height: 150 }
             });
             video.srcObject = stream;
-            
             return new Promise(resolve => {
-                video.onloadedmetadata = () => {
-                    resolve(video);
-                };
+                video.onloadedmetadata = () => resolve(video);
             });
         } catch (err) {
             console.error('Camera error:', err);
@@ -645,45 +912,35 @@
             throw err;
         }
     }
-    
+
     function processFrame() {
         if (!isRunning || !video) {
             requestAnimationFrame(processFrame);
             return;
         }
-        
+
         sourceCtx.drawImage(video, 0, 0, sourceCanvas.width, sourceCanvas.height);
-        
         const frameData = sourceCtx.getImageData(0, 0, sourceCanvas.width, sourceCanvas.height).data;
         const { left, right } = encoder.encodeFrame(frameData, sourceCanvas.width, sourceCanvas.height);
-        
-        // Feed audio through decoder in chunks
+
+        // Feed audio through decoder in chunks. subarray() is a view (no copy).
         const bufferSize = 512;
         for (let i = 0; i < left.length; i += bufferSize) {
-            const leftChunk = left.slice(i, i + bufferSize);
-            const rightChunk = right.slice(i, i + bufferSize);
-            decoder.process(leftChunk, rightChunk);
+            const end = Math.min(i + bufferSize, left.length);
+            decoder.process(left.subarray(i, end), right.subarray(i, end));
         }
 
-        // Queue audio for playback through speakers
-        for (let i = 0; i < left.length; i++) {
-            audioQueue.left.push(left[i]);
-            audioQueue.right.push(right[i]);
-        }
-        
-        // Visualize encoded signal
+        enqueueAudio(left, right);
         visualizeEncoded(left, right);
-        
-        // Schedule next frame based on FPS
+
         const fps = parseFloat(document.getElementById('fps').value);
         const frameInterval = 1000 / fps;
         setTimeout(() => requestAnimationFrame(processFrame), frameInterval);
     }
-    
+
     startBtn.addEventListener('click', async function() {
         startBtn.style.display = 'none';
         statusEl.textContent = 'Initializing...';
-        
         try {
             init();
             await startCamera();
