@@ -47,28 +47,39 @@ Camera → SlowscanEncoder → Audio Signal → SlowscanDecoder → Canvas Displ
 - Generates sync pulses for line/frame timing
 - Outputs stereo audio: left=luma, right=chroma
 - Handles interlaced field encoding (alternates even/odd lines)
-- Preallocates `Float32Array` scratch and output buffers sized from the frame dimensions; `encodeFrame` writes via an index (no `push` / spread) and produces zero per-frame heap allocations
-- Polyphase lowpass filter coefficients are computed once in the constructor; `resampleInto` has a fast no-mirror branch for interior samples
+- `encodeCanvas(canvas, ctx)` is the entry point and is async: with a `WebGLEncoder` attached (`config.gpu`) the whole encode runs in shaders; otherwise it calls `getImageData` and the CPU `encodeFrame`
+- CPU path: preallocated `Float32Array` output buffers; the oversampled scratch buffers are allocated on first CPU use. `encodeFrame` writes via an index (no `push` / spread) and produces zero per-frame heap allocations
+- Polyphase lowpass filter coefficients are computed once in the constructor (and uploaded as shader uniforms on the GPU path); `resampleInto` has a fast no-mirror branch for interior samples
+
+**WebGLEncoder (GLSL encoder)**
+- Default encoder backend when WebGL2 is available; a single instance (one WebGL context) is shared by every `SlowscanEncoder` that `init()` creates
+- The source canvas is uploaded as a texture (no `getImageData`), then two fragment passes run:
+  1. **Signal pass**: one fragment per oversampled sample. Works out whether the sample is field/line sync, quiet, or picture, and for picture samples fetches the source pixel and converts to Y / Cb / Cr
+  2. **Filter pass**: one fragment per output sample. Applies the lowpass + decimation (with edge mirroring identical to `resampleInto`) over the signal texture. Taps are unrolled at shader-build time with constant uniform indices
+- Both render targets are `RG32UI` holding `floatBitsToUint(left, right)`, so values stay full float32. Output matches `encodeFrame` to ~2e-7
+- Readback is asynchronous: `readPixels` into a pixel-pack buffer, `fenceSync`, poll the fence on a timer, then `getBufferSubData` into a buffer reinterpreted as `Float32Array`. The main thread is free while the GPU works. A result is discarded (resolves `null`) if the encoder was reconfigured meanwhile
 
 **SlowscanDecoder**
 - Processes stereo audio input sample-by-sample (in streaming chunks)
 - Uses Auto-Gain Control (AGC) tracking of signal bounds across chunks to map audio levels to color values correctly
 - Injects a small amount of pseudo-noise into samples during decoding to prevent zero-difference tracking issues in the AGC, faithfully matching original Python and JS reference decoders. Noise is sourced from a precomputed 4096-sample LUT with decorrelated L/C read indices — `Math.random()` is not called in the hot loop
 - Detects sync pulses to determine line/frame boundaries
-- Reconstructs YCbCr from audio levels; YCbCr→RGB is inlined in the per-sample loop to avoid array allocation
+- Reconstructs YCbCr from audio levels and stores the AGC-normalized values per sample. YCbCr→RGB, brightness and saturation are applied by the renderer at draw time (in the vertex shader with WebGL)
 - Chroma delay line is a preallocated `Float32Array`, not a growable JS array
-- Per-scanline color samples are written into `Float32Array` (phase) + `Uint8Array` (RGB), and line objects are recycled through a pool so the sample loop performs no per-sample allocation
-- Delegates display rendering to a pluggable renderer (WebGL preferred, Canvas 2D fallback)
+- Per-scanline samples are written into `Float32Array` (phase) + `Float32Array` (Y, Cb, Cr), and line objects are recycled through a pool so the sample loop performs no per-sample allocation
+- Delegates display rendering to a pluggable renderer (WebGL2 preferred, Canvas 2D fallback); `destroy()` frees the renderer's GPU resources when `init()` replaces the decoder
 
-**WebGLPhosphor (GLSL renderer)**
+**WebGLPhosphor (GLSL renderer, WebGL2)**
 - Default renderer for the decoded display
-- Each scanline is emitted as a triangle-strip quad whose two vertices carry identical per-sample RGB, so the GPU rasterizer interpolates color across each line
-- A simple fragment shader writes `vec4(v_col, 1.0)`; blend mode is additive (`ONE, ONE`) when the Blend Mode checkbox is on, approximating the original `screen` phosphor glow
+- Each batch of scanlines is uploaded as one `RGB32F` texture (one row per line, normalized Y/Cb/Cr per sample) plus a small per-line instance buffer (x start, x end, y + jitter, row, last sample index)
+- The whole batch is one `drawArraysInstanced` call: a triangle strip per line, two vertices per sample. The vertex shader pulls its sample from the texture by vertex index (from a static index buffer) and converts YCbCr→RGB with brightness/saturation. Lines shorter than the batch's longest collapse their spare vertices onto the last sample
+- The CPU builds no vertices; per batch it copies sample rows and writes 5 floats per line
+- The fragment shader writes the interpolated `vec4(v_col, 1.0)`; blend mode is additive (`ONE, ONE`) when the Blend Mode checkbox is on, approximating the original `screen` phosphor glow
 - Phosphor fade is implemented as a semi-transparent black quad drawn through the shader on a fixed interval
-- Replaces the slow CPU path of building many-stop `createLinearGradient` strokes per line in Canvas 2D
 
 **Canvas2DPhosphor (fallback)**
-- Used only if WebGL context creation fails
+- Used only if WebGL2 context creation fails
+- Converts YCbCr→RGB on the CPU for each gradient stop
 - Decimates gradient stops to a small maximum so `createLinearGradient` stays fast even at high per-line sample counts
 
 ### Synchronization and Dynamic Parameters
@@ -85,7 +96,7 @@ The system computes critical timing parameters dynamically whenever the `fps` or
 |-----------|---------|-------------|
 | `fps` | 3 | Frames per second |
 | `lines` | 150 | Vertical resolution |
-| `sampleRate` | 96000 | Audio sample rate |
+| `sampleRate` | 96000 | Audio sample rate (`SAMPLE_RATE`; shared by encoder, decoder and playback) |
 | `pulseLength` | 0.2ms | Sync pulse duration |
 | `oversample` | 10 | Oversampling factor for timing accuracy |
 | `hFreq` | 225 Hz | Horizontal line frequency |
@@ -166,7 +177,7 @@ B = Y + 1.766*Cb
 ## Display Rendering
 
 The decoder renders with CRT-style effects:
-- **GPU scanline quads**: Each scan line is a triangle-strip quad with per-vertex RGB; the GPU interpolates color along the line
+- **GPU scanlines**: Each scan line is an instanced triangle strip whose vertices pull and convert their own samples; the GPU interpolates color along the line
 - **Additive blend**: WebGL `blendFunc(ONE, ONE)` approximates the original Canvas `screen` phosphor glow
 - **Phosphor fade**: Gradual darkening via a semi-transparent black quad drawn on a fixed interval
 - **Jitter**: Random sub-pixel offset per line for analog noise aesthetic
@@ -174,16 +185,48 @@ The decoder renders with CRT-style effects:
 ### Pipeline pluggability
 
 The decoder selects its renderer at construction:
-1. Try `WebGLPhosphor` — uses GLSL vertex + fragment shaders.
+1. Try `WebGLPhosphor` — WebGL2, GLSL ES 3.00 vertex + fragment shaders.
 2. Fall back to `Canvas2DPhosphor` — uses `createLinearGradient` with decimated color stops.
 
-### Why not move decoding to a shader?
+The encoder backend is chosen once at page load: `WebGLEncoder` if a WebGL2 context can be created, otherwise the CPU path. The source canvas's 2D context is created with `willReadFrequently` only in the CPU case. That flag keeps the backing store CPU-side for `getImageData`, but the GPU path uploads the canvas as a texture, which is cheaper from a GPU-backed canvas.
 
-The decoder's sample loop is sequential by nature: AGC bounds, sync detection, and phase tracking all carry state forward sample-to-sample. GPU parallelism doesn't help a serial feedback loop, so the CPU loop was optimized in place (typed arrays, no allocations, precomputed noise LUT) rather than ported to GLSL. Only the render step — which is embarrassingly parallel per line/pixel — was moved to shaders.
+### What runs where
+
+| Stage | Where | Why |
+|-------|-------|-----|
+| RGB→YCbCr, sync generation, lowpass + decimation (encoder) | GPU (`WebGLEncoder`) | Every output sample is independent |
+| AGC, sync detection, phase tracking (decoder sample loop) | CPU | Sequential: each sample's state feeds the next |
+| YCbCr→RGB, brightness, saturation (decoder output) | GPU (`WebGLPhosphor` vertex shader) | Per sample, independent |
+| Scanline geometry + rasterization | GPU (`WebGLPhosphor`) | Per line / per pixel |
+
+The decoder's sample loop stays on the CPU: AGC bounds, sync detection, and phase tracking all carry state forward sample-to-sample, so GPU parallelism doesn't help. It was optimized in place (typed arrays, no allocations, precomputed noise LUT).
+
+### GPU notes (measured on Raspberry Pi 4, V3D 4.2, Chromium)
+
+- **8-bit textures return fp16 on V3D.** The signal pass rounds fetched texels back to exact bytes (`floor(c * 255.0 + 0.5)`). Without that the output drifts ~2.4e-4 from the CPU encoder.
+- **Loops over uniform arrays are slow on V3D.** A dynamically indexed `u_filter[j]` is fetched through the texture unit, so a 41-tap loop ran at half speed (and the compiler won't unroll it even with a constant bound). The filter pass is unrolled in JS with constant indices.
+- **A single-pass encoder was slower than the CPU.** One fragment per output sample rebuilding all 41 oversampled taps (with integer divisions and branching) took ~10 ms on V3D. As a separate signal pass plus an unrolled filter pass the GPU work is ~3 ms.
+- **Readback has a fixed ~2 ms round trip in Chrome**, even for a few bytes, so it is done asynchronously. The pixel-pack buffer gets fresh storage (`bufferData`) every frame; reusing it makes Chrome discard its readback shadow copy and log a performance warning.
+- **Fragment-heavy colour conversion was slower than per-vertex.** Converting YCbCr in the fragment shader (two float texel fetches per pixel) doubled the renderer's GPU time on V3D. Doing it per sample in the vertex shader keeps fragment work trivial.
+
+Per field at 6 fps / 200 lines (16,000 samples), Pi 4:
+
+| | Before (CPU encode, per-line draw calls) | After |
+|--|--|--|
+| Encoder, main-thread time | ~12–14 ms (blocking) | ~2.5–3 ms typical (submit + readback); GPU work runs async |
+| Renderer, CPU time per batch | ~1.7–2.4 ms | ~0.6–1.1 ms |
+| Renderer, GPU time per batch | ~2.6–3.3 ms | ~3.2–3.8 ms (vertex texture fetches; one draw call instead of ~100) |
+| Main-thread tasks > 10 ms (8 s of running app) | 42–43 | 3–8 |
 
 ## Audio Playback Queue
 
 Stereo samples produced by each encode pass are buffered for playback through `ScriptProcessorNode`. The queue is a **power-of-two `Float32Array` ring buffer** (262144 samples ≈ 2.7s at 96 kHz) with masked read/write indices. If the producer laps the consumer, the read head advances to drop the oldest samples rather than corrupting ordering. This replaced JS arrays that were grown with `push` and periodically `slice`-trimmed (O(n) churn on the audio thread).
+
+### Sample rate
+
+The encoder always produces `SAMPLE_RATE` (96 kHz) samples, and two other places have to agree with it:
+- **Decoder**: `init()` passes `sampleRate: SAMPLE_RATE`, which sets its line/frame timing targets, AGC decay and chroma delay length. Without it the decoder falls back to `audioCtx.sampleRate` (meant for live line-in input). On 48 kHz hardware that halves the expected line length and the picture breaks into horizontal stripes.
+- **Playback**: the `AudioContext` is created with `{ sampleRate: SAMPLE_RATE }` so the `ScriptProcessorNode` drains the queue as fast as the encoder fills it; the browser resamples to the output device. A browser that ignores the option still decodes correctly, but playback runs slow and the queue drops samples.
 
 ## Layout
 
@@ -202,7 +245,7 @@ The browser UI arranges the three canvases in two columns:
 
 ## Dependencies
 
-**Browser app**: No external dependencies (vanilla JavaScript + Web Audio API)
+**Browser app**: No external dependencies (vanilla JavaScript + Web Audio API + WebGL2, with CPU / Canvas 2D fallbacks)
 
 **Python encoder**: numpy, scipy, pillow, soundfile
 
